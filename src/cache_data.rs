@@ -75,3 +75,106 @@ where
         self.last_seq
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::SubscribeError;
+    use crate::event_stream::EventStream;
+    use std::future::Future;
+
+    // Mock TypeConfig for testing
+    #[derive(Debug, Default)]
+    struct TestConfig;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestValue {
+        seq: u64,
+        data: String,
+    }
+
+    impl TestValue {
+        fn new(seq: u64, data: &str) -> Self {
+            Self {
+                seq,
+                data: data.to_string(),
+            }
+        }
+    }
+
+    // Mock Source implementation
+    #[derive(Debug)]
+    struct MockSource;
+
+    #[async_trait::async_trait]
+    impl crate::type_config::Source<TestValue> for MockSource {
+        async fn subscribe(
+            &self,
+            _left: &str,
+            _right: &str,
+        ) -> Result<EventStream<TestValue>, SubscribeError> {
+            unimplemented!("Mock implementation for testing")
+        }
+    }
+
+    impl TypeConfig for TestConfig {
+        type Value = TestValue;
+        type Source = MockSource;
+
+        fn value_seq(value: &Self::Value) -> u64 {
+            value.seq
+        }
+
+        fn spawn<F>(_future: F, _name: impl ToString)
+        where
+            F: Future + Send + 'static,
+            F::Output: Send + 'static,
+        {
+            // Mock implementation - do nothing for tests
+        }
+    }
+
+    #[test]
+    fn test_default() {
+        let cache_data: CacheData<TestConfig> = CacheData::default();
+        assert_eq!(cache_data.last_seq, 0);
+        assert!(cache_data.data.is_empty());
+    }
+
+    #[test]
+    fn test_apply_update_scenarios() {
+        let mut cache_data: CacheData<TestConfig> = CacheData::default();
+
+        // Insert: None -> Some
+        let new_value = TestValue::new(5, "test");
+        let seq = cache_data.apply_update("key1".to_string(), None, Some(new_value.clone()));
+        assert_eq!(seq, 5);
+        assert_eq!(cache_data.last_seq, 5);
+        assert_eq!(cache_data.data.get("key1"), Some(&new_value));
+
+        // Update: Some -> Some
+        let updated_value = TestValue::new(10, "updated");
+        let seq = cache_data.apply_update(
+            "key1".to_string(),
+            Some(TestValue::new(5, "test")),
+            Some(updated_value.clone()),
+        );
+        assert_eq!(seq, 10);
+        assert_eq!(cache_data.last_seq, 10);
+        assert_eq!(cache_data.data.get("key1"), Some(&updated_value));
+
+        // Delete: Some -> None
+        cache_data.apply_update(
+            "key1".to_string(),
+            Some(TestValue::new(10, "updated")),
+            None,
+        );
+        assert!(!cache_data.data.contains_key("key1"));
+
+        // Invalid: None -> None (should not crash, just warn)
+        let seq_before = cache_data.last_seq;
+        cache_data.apply_update("key2".to_string(), None, None);
+        assert_eq!(cache_data.last_seq, seq_before); // Should remain unchanged
+        assert!(!cache_data.data.contains_key("key2"));
+    }
+}
