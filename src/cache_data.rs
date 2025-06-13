@@ -89,7 +89,7 @@ mod tests {
     use super::*;
     use crate::errors::SubscribeError;
     use crate::event_stream::EventStream;
-    use crate::sources::test_source::Val;
+    use crate::testing::source::Val;
     use std::future::Future;
 
     // Mock TypeConfig for testing

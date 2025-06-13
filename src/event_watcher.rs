@@ -23,17 +23,17 @@ use log::debug;
 use log::error;
 use log::info;
 use log::warn;
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 
-use crate::Source;
-use crate::TypeConfig;
 use crate::cache_data::CacheData;
 use crate::errors::ConnectionClosed;
 use crate::errors::SubscribeError;
 use crate::errors::Unsupported;
 use crate::event_stream::Event;
 use crate::event_stream::EventStream;
+use crate::Source;
+use crate::TypeConfig;
 
 /// Watch cache events and update local copy.
 pub(crate) struct EventWatcher<C: TypeConfig> {
@@ -54,8 +54,7 @@ pub(crate) struct EventWatcher<C: TypeConfig> {
 }
 
 impl<C> EventWatcher<C>
-where
-    C: TypeConfig,
+where C: TypeConfig
 {
     /// Subscribe to the key-value changes in the interested range and feed them into the local cache.
     ///
@@ -76,7 +75,7 @@ where
     pub(crate) async fn main(
         mut self,
         mut started: Option<oneshot::Sender<()>>,
-        mut cancel: impl Future<Output = ()> + Send + 'static,
+        cancel: impl Future<Output = ()> + Send + 'static,
     ) {
         // sleep time and reason
         let mut sleep = None::<(Duration, String)>;
@@ -244,7 +243,7 @@ where
     pub(crate) async fn watch_kv_changes(
         &mut self,
         mut strm: impl Stream<Item = Result<Event<C::Value>, ConnectionClosed>> + Send + Unpin + 'static,
-        mut cancel: impl Future<Output = ()> + Send,
+        cancel: impl Future<Output = ()> + Send,
     ) -> Result<(), ConnectionClosed> {
         let mut c = std::pin::pin!(cancel);
 
@@ -292,12 +291,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::sources::test_source::{TestSource, Val};
-
     use std::future::Future;
     use std::sync::Arc;
+
     use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::testing::source::TestSource;
+    use crate::testing::source::Val;
 
     // Test TypeConfig
     #[derive(Debug, Default)]
@@ -414,8 +415,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_cache_only_initialization() {
-        use crate::event_stream::{Change, Event};
         use futures::stream;
+
+        use crate::event_stream::Change;
+        use crate::event_stream::Event;
 
         // 构造事件流，包含所有类型Event
         let events = vec![
@@ -463,9 +466,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_cache_error_event() {
-        use crate::errors::ConnectionClosed;
-        use crate::event_stream::{Change, Event};
         use futures::stream;
+
+        use crate::errors::ConnectionClosed;
+        use crate::event_stream::Change;
+        use crate::event_stream::Event;
 
         // 构造事件流，包含Initialization、Err(ConnectionClosed)、InitializationComplete
         let events = vec![
@@ -498,8 +503,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_watch_kv_changes_basic() {
-        use crate::event_stream::{Change, Event};
         use futures::stream;
+
+        use crate::event_stream::Change;
+        use crate::event_stream::Event;
 
         // 构造只包含Change事件的流
         let events = vec![
@@ -546,8 +553,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_watch_kv_changes_cancel() {
-        use futures::stream;
         use std::time::Duration;
+
+        use futures::stream;
 
         // 构造一个永不结束的流
         let stream = stream::pending();
@@ -581,9 +589,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_watch_kv_changes_error_event() {
-        use crate::errors::ConnectionClosed;
-        use crate::event_stream::{Change, Event};
         use futures::stream;
+
+        use crate::errors::ConnectionClosed;
+        use crate::event_stream::Change;
+        use crate::event_stream::Event;
 
         // 构造流中间插入Err(ConnectionClosed)
         let events = vec![
@@ -630,8 +640,10 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "expected only change events")]
     async fn test_watch_kv_changes_unexpected_event() {
-        use crate::event_stream::{Change, Event};
         use futures::stream;
+
+        use crate::event_stream::Change;
+        use crate::event_stream::Event;
 
         // 构造流中插入非Change事件
         let events = vec![
@@ -673,8 +685,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_watch_kv_changes_multi_update_last_seq() {
-        use crate::event_stream::{Change, Event};
         use futures::stream;
+
+        use crate::event_stream::Change;
+        use crate::event_stream::Event;
 
         // 多次变更同一key，last_seq只取最大值
         let events = vec![
