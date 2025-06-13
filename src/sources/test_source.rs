@@ -17,16 +17,16 @@ struct Subscription {
 
 impl Subscription {
     fn emit_event(&self, key: Option<&str>, event: Event<Val>) -> Result<(), &'static str> {
-        if let Some(key) = key.clone() {
+        if let Some(key) = key {
             if key < self.left.as_str() || key >= self.right.as_str() {
                 return Ok(());
             }
         }
 
-        let res = self.sender.send(Ok(event.clone())).map_err(|_| "send");
+        
         // println!("Emitting event: {:?} for key: {:?}", event, key);
 
-        res
+        self.sender.send(Ok(event.clone())).map_err(|_| "send")
     }
 }
 
@@ -55,6 +55,12 @@ pub struct State {
 #[derive(Debug, Clone)]
 pub struct TestSource {
     pub state: Arc<Mutex<State>>,
+}
+
+impl Default for TestSource {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestSource {

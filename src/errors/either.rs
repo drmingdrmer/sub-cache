@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn test_enum_variants() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "test error");
+        let io_err = io::Error::other("test error");
         let either_a: Either<io::Error, String> = Either::A(io_err);
         let either_b: Either<io::Error, String> = Either::B("string error".to_string());
 

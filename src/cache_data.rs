@@ -18,7 +18,6 @@ use log::debug;
 use log::warn;
 
 use crate::TypeConfig;
-use crate::sources::test_source::Val;
 
 /// The local data that reflects a range of key-values on remote data store.
 #[derive(Debug, Clone)]

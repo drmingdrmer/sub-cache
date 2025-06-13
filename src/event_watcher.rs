@@ -294,7 +294,7 @@ where
 mod tests {
     use super::*;
     use crate::sources::test_source::{TestSource, Val};
-    use futures::StreamExt;
+    
     use std::future::Future;
     use std::sync::Arc;
     use tokio::sync::Mutex;
