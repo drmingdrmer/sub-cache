@@ -543,4 +543,178 @@ mod tests {
         assert_eq!(cache_data.data.get("k2"), Some(&Val::new(2, "v2")));
         assert_eq!(cache_data.last_seq, 2);
     }
+
+    #[tokio::test]
+    async fn test_watch_kv_changes_cancel() {
+        use futures::stream;
+        use std::time::Duration;
+
+        // 构造一个永不结束的流
+        let stream = stream::pending();
+
+        let cache = Arc::new(Mutex::new(Ok(CacheData::default())));
+        let mut watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: TestSource::new(),
+            data: cache.clone(),
+            name: "test-watch-kv-changes-cancel".to_string(),
+        };
+
+        // cancel信号，50ms后触发
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+        let handle = tokio::spawn(async move { watcher.watch_kv_changes(stream, cancel).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = cancel_tx.send(());
+        let res = handle.await.unwrap();
+        assert!(res.is_ok());
+
+        // 检查cache内容应为空
+        let cache_data = cache.lock().await;
+        let cache_data = cache_data.as_ref().unwrap();
+        assert!(cache_data.data.is_empty());
+        assert_eq!(cache_data.last_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn test_watch_kv_changes_error_event() {
+        use crate::errors::ConnectionClosed;
+        use crate::event_stream::{Change, Event};
+        use futures::stream;
+
+        // 构造流中间插入Err(ConnectionClosed)
+        let events = vec![
+            Ok(Event::Change(Change::new(
+                "k1",
+                None,
+                Some(Val::new(1, "v1")),
+            ))),
+            Err(ConnectionClosed::new_str("test error")),
+            Ok(Event::Change(Change::new(
+                "k2",
+                None,
+                Some(Val::new(2, "v2")),
+            ))),
+        ];
+        let stream = stream::iter(events);
+
+        let cache = Arc::new(Mutex::new(Ok(CacheData::default())));
+        let mut watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: TestSource::new(),
+            data: cache.clone(),
+            name: "test-watch-kv-changes-error".to_string(),
+        };
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+        let res = watcher.watch_kv_changes(stream, cancel).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("test error"));
+
+        // 检查cache内容只包含第一个事件
+        let cache_data = cache.lock().await;
+        let cache_data = cache_data.as_ref().unwrap();
+        assert_eq!(cache_data.data.get("k1"), Some(&Val::new(1, "v1")));
+        assert!(cache_data.data.get("k2").is_none());
+        assert_eq!(cache_data.last_seq, 1);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected only change events")]
+    async fn test_watch_kv_changes_unexpected_event() {
+        use crate::event_stream::{Change, Event};
+        use futures::stream;
+
+        // 构造流中插入非Change事件
+        let events = vec![
+            Ok(Event::Change(Change::new(
+                "k1",
+                None,
+                Some(Val::new(1, "v1")),
+            ))),
+            Ok(Event::Initialization(Change::new(
+                "k2",
+                None,
+                Some(Val::new(2, "v2")),
+            ))),
+        ];
+        let stream = stream::iter(events);
+
+        let cache = Arc::new(Mutex::new(Ok(CacheData::default())));
+        let mut watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: TestSource::new(),
+            data: cache.clone(),
+            name: "test-watch-kv-changes-unexpected".to_string(),
+        };
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+        let _ = watcher.watch_kv_changes(stream, cancel).await;
+
+        // 检查panic前cache内容（只处理第一个Change）
+        let cache_data = cache.lock().await;
+        let cache_data = cache_data.as_ref().unwrap();
+        assert_eq!(cache_data.data.get("k1"), Some(&Val::new(1, "v1")));
+        assert!(cache_data.data.get("k2").is_none());
+        assert_eq!(cache_data.last_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn test_watch_kv_changes_multi_update_last_seq() {
+        use crate::event_stream::{Change, Event};
+        use futures::stream;
+
+        // 多次变更同一key，last_seq只取最大值
+        let events = vec![
+            Ok(Event::Change(Change::new(
+                "k1",
+                None,
+                Some(Val::new(1, "v1")),
+            ))),
+            Ok(Event::Change(Change::new(
+                "k1",
+                Some(Val::new(1, "v1")),
+                Some(Val::new(5, "v1x")),
+            ))),
+            Ok(Event::Change(Change::new(
+                "k1",
+                Some(Val::new(5, "v1x")),
+                Some(Val::new(3, "v1y")),
+            ))),
+        ];
+        let stream = stream::iter(events);
+
+        let cache = Arc::new(Mutex::new(Ok(CacheData::default())));
+        let mut watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: TestSource::new(),
+            data: cache.clone(),
+            name: "test-watch-kv-changes-multi-update".to_string(),
+        };
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+        let _ = watcher.watch_kv_changes(stream, cancel).await;
+
+        let cache_data = cache.lock().await;
+        let cache_data = cache_data.as_ref().unwrap();
+        // last_seq应为最大值5，内容为最后一次变更
+        assert_eq!(cache_data.last_seq, 5);
+        assert_eq!(cache_data.data.get("k1"), Some(&Val::new(3, "v1y")));
+    }
 }
