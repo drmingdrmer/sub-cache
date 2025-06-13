@@ -411,4 +411,88 @@ mod tests {
         let _ = cancel_tx.send(());
         let _ = handle.await;
     }
+
+    #[tokio::test]
+    async fn test_initialize_cache_only_initialization() {
+        use crate::event_stream::{Change, Event};
+        use futures::stream;
+
+        // 构造事件流，包含所有类型Event
+        let events = vec![
+            Ok(Event::Initialization(Change::new(
+                "k1",
+                None,
+                Some(Val::new(1, "v1")),
+            ))),
+            Ok(Event::Initialization(Change::new(
+                "k2",
+                None,
+                Some(Val::new(2, "v2")),
+            ))),
+            Ok(Event::InitializationComplete),
+            // InitializationComplete后即使还有事件也不应被处理
+            Ok(Event::Change(Change::new(
+                "should_also_not_be_seen",
+                None,
+                Some(Val::new(100, "fail2")),
+            ))),
+        ];
+        let mut stream: crate::event_stream::EventStream<Val> = Box::pin(stream::iter(events));
+
+        let watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: TestSource::new(),
+            data: Arc::new(Mutex::new(Ok(CacheData::default()))),
+            name: "test-init-cache".to_string(),
+        };
+
+        let mut cache_data = CacheData::<TestConfig>::default();
+        watcher
+            .initialize_cache(&mut cache_data, &mut stream)
+            .await
+            .unwrap();
+
+        // 断言cache_data被正确填充，且Change事件未被处理
+        assert_eq!(cache_data.data.get("k1"), Some(&Val::new(1, "v1")));
+        assert_eq!(cache_data.data.get("k2"), Some(&Val::new(2, "v2")));
+        assert!(cache_data.data.get("should_not_be_seen").is_none());
+        assert!(cache_data.data.get("should_also_not_be_seen").is_none());
+        assert_eq!(cache_data.last_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_cache_error_event() {
+        use crate::errors::ConnectionClosed;
+        use crate::event_stream::{Change, Event};
+        use futures::stream;
+
+        // 构造事件流，包含Initialization、Err(ConnectionClosed)、InitializationComplete
+        let events = vec![
+            Ok(Event::Initialization(Change::new(
+                "k1",
+                None,
+                Some(Val::new(1, "v1")),
+            ))),
+            Err(ConnectionClosed::new_str("test error")),
+            Ok(Event::InitializationComplete),
+        ];
+        let mut stream: crate::event_stream::EventStream<Val> = Box::pin(stream::iter(events));
+
+        let watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: TestSource::new(),
+            data: Arc::new(Mutex::new(Ok(CacheData::default()))),
+            name: "test-init-cache-error".to_string(),
+        };
+
+        let mut cache_data = CacheData::<TestConfig>::default();
+        let res = watcher.initialize_cache(&mut cache_data, &mut stream).await;
+
+        // 断言返回了Err(ConnectionClosed)
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("test error"));
+    }
 }
