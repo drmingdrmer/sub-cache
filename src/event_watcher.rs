@@ -294,7 +294,7 @@ where
 mod tests {
     use super::*;
     use crate::sources::test_source::{TestSource, Val};
-    
+
     use std::future::Future;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -494,5 +494,53 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(err.to_string().contains("test error"));
+    }
+
+    #[tokio::test]
+    async fn test_watch_kv_changes_basic() {
+        use crate::event_stream::{Change, Event};
+        use futures::stream;
+
+        // 构造只包含Change事件的流
+        let events = vec![
+            Ok(Event::Change(Change::new(
+                "k1",
+                None,
+                Some(Val::new(1, "v1")),
+            ))),
+            Ok(Event::Change(Change::new(
+                "k2",
+                None,
+                Some(Val::new(2, "v2")),
+            ))),
+        ];
+        let stream = stream::iter(events);
+
+        let cache = Arc::new(Mutex::new(Ok(CacheData::default())));
+        let mut watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: TestSource::new(),
+            data: cache.clone(),
+            name: "test-watch-kv-changes".to_string(),
+        };
+
+        // 用oneshot作为cancel信号，测试不会提前退出
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+
+        // 执行watch_kv_changes
+        let res = watcher.watch_kv_changes(stream, cancel).await;
+        // 由于流会结束，应该返回Err(ConnectionClosed)
+        assert!(res.is_err());
+
+        // 检查cache内容
+        let cache_data = cache.lock().await;
+        let cache_data = cache_data.as_ref().unwrap();
+        assert_eq!(cache_data.data.get("k1"), Some(&Val::new(1, "v1")));
+        assert_eq!(cache_data.data.get("k2"), Some(&Val::new(2, "v2")));
+        assert_eq!(cache_data.last_seq, 2);
     }
 }
