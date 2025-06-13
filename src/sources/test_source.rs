@@ -17,12 +17,16 @@ struct Subscription {
 
 impl Subscription {
     fn emit_event(&self, key: Option<&str>, event: Event<Val>) -> Result<(), &'static str> {
-        if let Some(key) = key {
+        if let Some(key) = key.clone() {
             if key < self.left.as_str() || key >= self.right.as_str() {
                 return Ok(());
             }
         }
-        self.sender.send(Ok(event)).map_err(|_| "send")
+
+        let res = self.sender.send(Ok(event.clone())).map_err(|_| "send");
+        // println!("Emitting event: {:?} for key: {:?}", event, key);
+
+        res
     }
 }
 
@@ -128,9 +132,9 @@ impl TestSource {
     }
 
     #[cfg(test)]
-    pub async fn insert_for_test(&self, key: String, val: Val) {
+    pub async fn insert_for_test(&self, key: impl ToString, val: Val) {
         let mut state = self.state.lock().await;
-        state.data.insert(key, val);
+        state.data.insert(key.to_string(), val);
     }
 }
 
@@ -192,7 +196,7 @@ mod tests {
 
         // stream1 should see all changes except "z"
         let mut seen1 = vec![];
-        for _ in 0..4 {
+        for _ in 0..5 {
             if let Some(Ok(Event::Change(change))) = stream1.next().await {
                 let (k, _, v) = change.unpack();
                 seen1.push((k, v.map(|v| v.data)));
@@ -209,7 +213,7 @@ mod tests {
 
         // stream2 should only see changes for "m"
         let mut seen2 = vec![];
-        for _ in 0..2 {
+        for _ in 0..3 {
             if let Some(Ok(Event::Change(change))) = stream2.next().await {
                 let (k, _, v) = change.unpack();
                 seen2.push((k, v.map(|v| v.data)));

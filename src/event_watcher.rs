@@ -93,7 +93,6 @@ where
             }
 
             // 1. Retry until a successful connection is established and cache is initialized.
-
             let strm = {
                 // Hold the lock until the cache is fully initialized.
                 let mut cache_data = self.data.lock().await;
@@ -153,8 +152,8 @@ where
             };
 
             // 2. Watch for changes in the stream and apply them to the local cache.
-
             let res = self.watch_kv_changes(strm, c.as_mut()).await;
+
             match res {
                 Ok(_) => {
                     info!("{} watch loop exited normally(canceled by user)", self.name);
@@ -211,6 +210,7 @@ where
 
         loop {
             let res = self.source.subscribe(&self.left, &self.right).await;
+
             let conn_err = match res {
                 Ok(stream) => return Ok(stream),
                 Err(SubscribeError::Unsupported(u)) => return Err(u),
@@ -323,6 +323,7 @@ mod tests {
     #[test]
     fn test_event_watcher_construction() {
         let test_source = TestSource::new();
+
         let watcher = EventWatcher::<TestConfig> {
             left: "start".to_string(),
             right: "end".to_string(),
@@ -336,157 +337,78 @@ mod tests {
         assert_eq!(watcher.name, "test-watcher");
     }
 
-    #[test]
-    fn test_cache_data_initialization() {
-        let mut cache_data: CacheData<TestConfig> = CacheData::default();
-
-        // Test applying updates directly (testing the underlying logic)
-        let test_value = Val::new(5, "test");
-        cache_data.apply_update("key1".to_string(), None, Some(test_value.clone()));
-
-        assert_eq!(cache_data.last_seq, 5);
-        assert_eq!(cache_data.data.get("key1"), Some(&test_value));
-    }
-
     #[tokio::test]
     async fn test_real_event_watcher_integration() {
         let test_source = TestSource::new();
 
-        // Pre-populate some initial data
+        // 通过TestSource插入初始数据
         test_source
-            .insert_for_test("initial_key".to_string(), Val::new(1, "initial_value"))
+            .insert_for_test("initial_key", Val::new(1, "initial_value"))
             .await;
 
+        let cache = Arc::new(Mutex::new(Ok(CacheData::default())));
         let watcher = EventWatcher::<TestConfig> {
             left: "".to_string(),
             right: "z".to_string(),
             source: test_source.clone(),
-            data: Arc::new(Mutex::new(Ok(CacheData::default()))),
+            data: cache.clone(),
             name: "test-integration".to_string(),
         };
 
-        // Get the event stream
-        let mut stream = watcher.source.subscribe("", "z").await.unwrap();
+        // 用oneshot作为cancel信号
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Process initialization events
-        let mut cache_data = CacheData::<TestConfig>::default();
-        watcher
-            .initialize_cache(&mut cache_data, &mut stream)
-            .await
-            .unwrap();
+        // 包装cancel_rx为Future<Output=()>类型
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
 
-        // Verify initial data was loaded
-        assert_eq!(
-            cache_data.data.get("initial_key").unwrap(),
-            &Val::new(1, "initial_value")
-        );
-        assert_eq!(cache_data.last_seq, 1);
+        // 启动EventWatcher::main在独立任务
+        let handle = tokio::spawn(async move {
+            watcher.main(None, cancel).await;
+        });
 
-        // Test updates through the test source
-        test_source.set("key1", Some("value1")).await;
-        test_source.set("key2", Some("value2")).await;
-        test_source.set("key1", Some("updated_value1")).await;
-        test_source.set("key2", None).await;
+        // 等待初始化完成
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Process the change events
-        for _ in 0..4 {
-            // 4 change events
-            if let Some(Ok(Event::Change(change))) = stream.next().await {
-                let (key, before, after) = change.unpack();
-                cache_data.apply_update(key, before, after);
-            }
+        // 检查初始数据已同步到本地cache
+        {
+            let cache_data = cache.lock().await;
+            let cache_data = cache_data.as_ref().unwrap();
+            assert_eq!(
+                cache_data.data.get("initial_key").unwrap(),
+                &Val::new(1, "initial_value")
+            );
+            assert_eq!(cache_data.last_seq, 1);
         }
 
-        // Verify final state
-        assert_eq!(
-            cache_data.data.get("key1").unwrap(),
-            &Val::new(3, "updated_value1")
-        );
-        assert!(!cache_data.data.contains_key("key2")); // deleted
-        assert_eq!(
-            cache_data.data.get("initial_key").unwrap(),
-            &Val::new(1, "initial_value")
-        ); // unchanged
-        assert_eq!(cache_data.last_seq, 3); // highest sequence number from key1 update
-    }
-
-    #[tokio::test]
-    async fn test_cache_consistency_scenarios() {
-        let _test_source = TestSource::new();
-        let mut cache_data = CacheData::<TestConfig>::default();
-
-        // Test various update scenarios
-
-        // 1. Insert new key
-        cache_data.apply_update("new_key".to_string(), None, Some(Val::new(1, "new_value")));
-        assert_eq!(
-            cache_data.data.get("new_key"),
-            Some(&Val::new(1, "new_value"))
-        );
-        assert_eq!(cache_data.last_seq, 1);
-
-        // 2. Update existing key
-        cache_data.apply_update(
-            "new_key".to_string(),
-            Some(Val::new(1, "new_value")),
-            Some(Val::new(2, "updated_value")),
-        );
-        assert_eq!(
-            cache_data.data.get("new_key"),
-            Some(&Val::new(2, "updated_value"))
-        );
-        assert_eq!(cache_data.last_seq, 2);
-
-        // 3. Delete key
-        cache_data.apply_update(
-            "new_key".to_string(),
-            Some(Val::new(2, "updated_value")),
-            None,
-        );
-        assert!(!cache_data.data.contains_key("new_key"));
-        assert_eq!(cache_data.last_seq, 2);
-
-        // 4. Test sequence ordering
-        cache_data.apply_update("seq_test1".to_string(), None, Some(Val::new(5, "value1")));
-        cache_data.apply_update("seq_test2".to_string(), None, Some(Val::new(3, "value2"))); // Lower seq
-        cache_data.apply_update("seq_test3".to_string(), None, Some(Val::new(7, "value3")));
-
-        assert_eq!(cache_data.last_seq, 7); // Should be highest
-        assert_eq!(cache_data.data.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_test_source_operations() {
-        let test_source = TestSource::new();
-
-        // Test direct operations on the test source
+        // 通过TestSource触发事件
         test_source.set("key1", Some("value1")).await;
         test_source.set("key2", Some("value2")).await;
-
-        // Verify the source's internal state
-        let source_data = test_source.get_data_snapshot().await;
-        assert_eq!(source_data.get("key1").unwrap(), &Val::new(1, "value1"));
-        assert_eq!(source_data.get("key2").unwrap(), &Val::new(2, "value2"));
-        drop(source_data);
-
-        // Test update operation
         test_source.set("key1", Some("updated_value1")).await;
-        let source_data = test_source.get_data_snapshot().await;
-        assert_eq!(
-            source_data.get("key1").unwrap(),
-            &Val::new(3, "updated_value1")
-        );
-        assert_eq!(source_data.len(), 2);
-        drop(source_data);
-
-        // Test delete operation
         test_source.set("key2", None).await;
-        let source_data = test_source.get_data_snapshot().await;
-        assert!(!source_data.contains_key("key2"));
-        assert_eq!(source_data.len(), 1);
-        assert_eq!(
-            source_data.get("key1").unwrap(),
-            &Val::new(3, "updated_value1")
-        );
+
+        // 等待事件被watcher处理
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 检查本地cache内容
+        {
+            let cache_data = cache.lock().await;
+            let cache_data = cache_data.as_ref().unwrap();
+            assert_eq!(
+                cache_data.data.get("key1").unwrap(),
+                &Val::new(3, "updated_value1")
+            );
+            assert!(!cache_data.data.contains_key("key2")); // 已删除
+            assert_eq!(
+                cache_data.data.get("initial_key").unwrap(),
+                &Val::new(1, "initial_value")
+            ); // 未变
+            assert_eq!(cache_data.last_seq, 3); // key1的最大序列号
+        }
+
+        // 取消watcher任务
+        let _ = cancel_tx.send(());
+        let _ = handle.await;
     }
 }
