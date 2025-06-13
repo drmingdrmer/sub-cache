@@ -293,7 +293,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_stream::Change;
     use crate::sources::test_source::{TestSource, Val};
     use futures::StreamExt;
     use std::future::Future;
@@ -355,10 +354,8 @@ mod tests {
 
         // Pre-populate some initial data
         test_source
-            .data
-            .lock()
-            .await
-            .insert("initial_key".to_string(), Val::new(1, "initial_value"));
+            .insert_for_test("initial_key".to_string(), Val::new(1, "initial_value"))
+            .await;
 
         let watcher = EventWatcher::<TestConfig> {
             left: "".to_string(),
@@ -467,14 +464,14 @@ mod tests {
         test_source.set("key2", Some("value2")).await;
 
         // Verify the source's internal state
-        let source_data = test_source.data.lock().await;
+        let source_data = test_source.get_data_snapshot().await;
         assert_eq!(source_data.get("key1").unwrap(), &Val::new(1, "value1"));
         assert_eq!(source_data.get("key2").unwrap(), &Val::new(2, "value2"));
         drop(source_data);
 
         // Test update operation
         test_source.set("key1", Some("updated_value1")).await;
-        let source_data = test_source.data.lock().await;
+        let source_data = test_source.get_data_snapshot().await;
         assert_eq!(
             source_data.get("key1").unwrap(),
             &Val::new(3, "updated_value1")
@@ -484,7 +481,7 @@ mod tests {
 
         // Test delete operation
         test_source.set("key2", None).await;
-        let source_data = test_source.data.lock().await;
+        let source_data = test_source.get_data_snapshot().await;
         assert!(!source_data.contains_key("key2"));
         assert_eq!(source_data.len(), 1);
         assert_eq!(

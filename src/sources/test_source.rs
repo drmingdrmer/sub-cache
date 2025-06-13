@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
+#[derive(Debug)]
 struct Subscription {
     left: String,
     right: String,
@@ -41,8 +42,8 @@ impl Val {
 }
 
 #[derive(Debug)]
-struct State {
-    data: BTreeMap<String, Val>,
+pub struct State {
+    pub data: BTreeMap<String, Val>,
     seq_counter: u64,
     subscriptions: Vec<Subscription>,
 }
@@ -66,7 +67,7 @@ impl TestSource {
     /// Insert, update, or delete a key-value pair.
     /// If value is Some, insert/update; if None, delete.
     pub async fn set(&self, key: &str, value: Option<&str>) {
-        let (prev_value, new_value) = {
+        let (_prev_value, _new_value) = {
             let mut state = self.state.lock().await;
 
             state.seq_counter += 1;
@@ -98,10 +99,14 @@ impl TestSource {
     }
 
     async fn send_initial_data(&self) {
-        let mut state = self.state.lock().await;
+        // 先收集 data 快照，避免借用冲突
+        let (data_snapshot, mut subscriptions) = {
+            let mut state = self.state.lock().await;
+            (state.data.clone(), std::mem::take(&mut state.subscriptions))
+        };
 
-        for (key, value) in state.data.iter() {
-            state.subscriptions.retain_mut(|sub| {
+        for (key, value) in data_snapshot.iter() {
+            subscriptions.retain_mut(|sub| {
                 sub.emit_event(
                     Some(key),
                     Event::Initialization(Change::new(key, None, Some(value.clone()))),
@@ -110,9 +115,22 @@ impl TestSource {
             });
         }
 
-        state
-            .subscriptions
-            .retain_mut(|sub| sub.emit_event(None, Event::InitializationComplete).is_ok());
+        subscriptions.retain_mut(|sub| sub.emit_event(None, Event::InitializationComplete).is_ok());
+
+        // 重新放回 subscriptions
+        let mut state = self.state.lock().await;
+        state.subscriptions = subscriptions;
+    }
+
+    pub async fn get_data_snapshot(&self) -> BTreeMap<String, Val> {
+        let state = self.state.lock().await;
+        state.data.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn insert_for_test(&self, key: String, val: Val) {
+        let mut state = self.state.lock().await;
+        state.data.insert(key, val);
     }
 }
 
@@ -134,5 +152,153 @@ impl Source<Val> for TestSource {
 
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_stream::Event;
+    use futures::StreamExt;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_set_and_get() {
+        let src = TestSource::new();
+        src.set("a", Some("v1")).await;
+        src.set("b", Some("v2")).await;
+        src.set("a", Some("v3")).await;
+        src.set("b", None).await;
+
+        let state = src.state.lock().await;
+        assert_eq!(state.data.get("a"), Some(&Val::new(3, "v3")));
+        assert!(!state.data.contains_key("b"));
+        assert_eq!(state.seq_counter, 4);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_and_event_delivery() {
+        let src = TestSource::new();
+
+        // Subscribe to all keys
+        let mut stream1 = src.subscribe("a", "z").await.unwrap();
+        // Subscribe to only keys >= "m"
+        let mut stream2 = src.subscribe("m", "z").await.unwrap();
+
+        src.set("a", Some("v1")).await;
+        src.set("m", Some("v2")).await;
+        src.set("z", Some("v3")).await;
+        src.set("m", None).await;
+
+        // stream1 should see all changes except "z"
+        let mut seen1 = vec![];
+        for _ in 0..4 {
+            if let Some(Ok(Event::Change(change))) = stream1.next().await {
+                let (k, _, v) = change.unpack();
+                seen1.push((k, v.map(|v| v.data)));
+            }
+        }
+        assert_eq!(
+            seen1,
+            vec![
+                ("a".to_string(), Some("v1".to_string())),
+                ("m".to_string(), Some("v2".to_string())),
+                ("m".to_string(), None),
+            ]
+        );
+
+        // stream2 should only see changes for "m"
+        let mut seen2 = vec![];
+        for _ in 0..2 {
+            if let Some(Ok(Event::Change(change))) = stream2.next().await {
+                let (k, _, v) = change.unpack();
+                seen2.push((k, v.map(|v| v.data)));
+            }
+        }
+        assert_eq!(
+            seen2,
+            vec![
+                ("m".to_string(), Some("v2".to_string())),
+                ("m".to_string(), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscription_removal_on_send_fail() {
+        let src = TestSource::new();
+        // Create a subscription and drop the receiver immediately
+        let (tx, rx) = mpsc::unbounded_channel();
+        {
+            let mut state = src.state.lock().await;
+            state.subscriptions.push(Subscription {
+                left: "a".to_string(),
+                right: "z".to_string(),
+                sender: tx,
+            });
+        }
+        drop(rx); // Simulate receiver dropped
+        src.set("a", Some("v1")).await;
+        let state = src.state.lock().await;
+        assert!(state.subscriptions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_initialization_and_change_events() {
+        let src = TestSource::new();
+
+        // Pre-populate some data
+        src.set("a", Some("v1")).await;
+        src.set("b", Some("v2")).await;
+        src.set("c", Some("v3")).await;
+
+        // Subscribe to all keys
+        let mut stream = src.subscribe("a", "z").await.unwrap();
+
+        // Should receive initialization for all keys in order, then InitializationComplete
+        let mut events = vec![];
+        for _ in 0..3 {
+            if let Some(Ok(Event::Initialization(change))) = stream.next().await {
+                let (k, _, v) = change.unpack();
+                events.push(("init", k, v.map(|v| v.data)));
+            }
+        }
+        if let Some(Ok(Event::InitializationComplete)) = stream.next().await {
+            events.push(("complete", String::new(), None));
+        }
+
+        assert_eq!(events[0].0, "init");
+        assert_eq!(events[1].0, "init");
+        assert_eq!(events[2].0, "init");
+        assert_eq!(events[3].0, "complete");
+        let keys: Vec<_> = events
+            .iter()
+            .filter(|e| e.0 == "init")
+            .map(|e| &e.1)
+            .collect();
+        assert!(keys.contains(&&"a".to_string()));
+        assert!(keys.contains(&&"b".to_string()));
+        assert!(keys.contains(&&"c".to_string()));
+
+        // After initialization, should receive change events
+        src.set("b", Some("v2x")).await;
+        src.set("d", Some("v4")).await;
+        src.set("a", None).await;
+
+        let mut changes = vec![];
+        for _ in 0..3 {
+            if let Some(Ok(Event::Change(change))) = stream.next().await {
+                let (k, _, v) = change.unpack();
+                changes.push((k, v.map(|v| v.data)));
+            }
+        }
+        assert_eq!(
+            changes,
+            vec![
+                ("b".to_string(), Some("v2x".to_string())),
+                ("d".to_string(), Some("v4".to_string())),
+                ("a".to_string(), None),
+            ]
+        );
     }
 }

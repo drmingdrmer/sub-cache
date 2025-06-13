@@ -159,11 +159,7 @@ mod tests {
         assert_eq!(cache_data.data.get("key1"), Some(&updated_value));
 
         // Delete: Some -> None
-        cache_data.apply_update(
-            "key1".to_string(),
-            Some(Val::new(10, "updated")),
-            None,
-        );
+        cache_data.apply_update("key1".to_string(), Some(Val::new(10, "updated")), None);
         assert!(!cache_data.data.contains_key("key1"));
 
         // Invalid: None -> None (should not crash, just warn)
