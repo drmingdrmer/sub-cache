@@ -18,12 +18,14 @@ use log::debug;
 use log::warn;
 
 use crate::TypeConfig;
+use crate::sources::test_source::Val;
 
 /// The local data that reflects a range of key-values on remote data store.
 #[derive(Debug, Clone)]
 pub struct CacheData<C: TypeConfig> {
     /// The last sequence number ever seen from the remote data store.
     pub last_seq: u64,
+
     /// The key-value data stored in the cache.
     pub data: BTreeMap<String, C::Value>,
 }
@@ -57,20 +59,27 @@ where
             "Cache process update(key: {}, prev: {:?}, current: {:?})",
             key, prev, current
         );
+
         match (prev, current) {
             (_, Some(entry)) => {
-                self.last_seq = C::value_seq(&entry);
+                let entry_seq = C::value_seq(&entry);
+                if entry_seq > self.last_seq {
+                    self.last_seq = entry_seq;
+                }
+
                 self.data.insert(key, entry);
             }
+
             (Some(_entry), None) => {
                 self.data.remove(&key);
             }
+
             (None, None) => {
                 warn!(
                     "both prev and current are None when Cache processing watch response; Not possible, but ignoring"
                 );
             }
-        };
+        }
 
         self.last_seq
     }
@@ -87,38 +96,23 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestConfig;
 
-    #[derive(Debug, Clone, PartialEq)]
-    struct TestValue {
-        seq: u64,
-        data: String,
-    }
-
-    impl TestValue {
-        fn new(seq: u64, data: &str) -> Self {
-            Self {
-                seq,
-                data: data.to_string(),
-            }
-        }
-    }
-
     // Mock Source implementation
     #[derive(Debug)]
     struct MockSource;
 
     #[async_trait::async_trait]
-    impl crate::type_config::Source<TestValue> for MockSource {
+    impl crate::type_config::Source<Val> for MockSource {
         async fn subscribe(
             &self,
             _left: &str,
             _right: &str,
-        ) -> Result<EventStream<TestValue>, SubscribeError> {
+        ) -> Result<EventStream<Val>, SubscribeError> {
             unimplemented!("Mock implementation for testing")
         }
     }
 
     impl TypeConfig for TestConfig {
-        type Value = TestValue;
+        type Value = Val;
         type Source = MockSource;
 
         fn value_seq(value: &Self::Value) -> u64 {
@@ -137,6 +131,7 @@ mod tests {
     #[test]
     fn test_default() {
         let cache_data: CacheData<TestConfig> = CacheData::default();
+
         assert_eq!(cache_data.last_seq, 0);
         assert!(cache_data.data.is_empty());
     }
@@ -146,17 +141,17 @@ mod tests {
         let mut cache_data: CacheData<TestConfig> = CacheData::default();
 
         // Insert: None -> Some
-        let new_value = TestValue::new(5, "test");
+        let new_value = Val::new(5, "test");
         let seq = cache_data.apply_update("key1".to_string(), None, Some(new_value.clone()));
         assert_eq!(seq, 5);
         assert_eq!(cache_data.last_seq, 5);
         assert_eq!(cache_data.data.get("key1"), Some(&new_value));
 
         // Update: Some -> Some
-        let updated_value = TestValue::new(10, "updated");
+        let updated_value = Val::new(10, "updated");
         let seq = cache_data.apply_update(
             "key1".to_string(),
-            Some(TestValue::new(5, "test")),
+            Some(Val::new(5, "test")),
             Some(updated_value.clone()),
         );
         assert_eq!(seq, 10);
@@ -166,7 +161,7 @@ mod tests {
         // Delete: Some -> None
         cache_data.apply_update(
             "key1".to_string(),
-            Some(TestValue::new(10, "updated")),
+            Some(Val::new(10, "updated")),
             None,
         );
         assert!(!cache_data.data.contains_key("key1"));
@@ -176,5 +171,25 @@ mod tests {
         cache_data.apply_update("key2".to_string(), None, None);
         assert_eq!(cache_data.last_seq, seq_before); // Should remain unchanged
         assert!(!cache_data.data.contains_key("key2"));
+    }
+
+    #[test]
+    fn test_last_seq_not_decreased() {
+        let mut cache_data: CacheData<TestConfig> = CacheData::default();
+
+        // Insert with seq 10
+        let v10 = Val::new(10, "v10");
+        cache_data.apply_update("k".to_string(), None, Some(v10.clone()));
+        assert_eq!(cache_data.last_seq, 10);
+
+        // Update with seq 5 (should not decrease last_seq)
+        let v5 = Val::new(5, "v5");
+        cache_data.apply_update("k".to_string(), Some(v10.clone()), Some(v5.clone()));
+        assert_eq!(cache_data.last_seq, 10);
+
+        // Update with seq 20 (should increase last_seq)
+        let v20 = Val::new(20, "v20");
+        cache_data.apply_update("k".to_string(), Some(v5.clone()), Some(v20.clone()));
+        assert_eq!(cache_data.last_seq, 20);
     }
 }

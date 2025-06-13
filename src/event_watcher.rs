@@ -293,65 +293,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_stream::Change;
+    use crate::sources::test_source::{TestSource, Val};
+    use futures::StreamExt;
     use std::future::Future;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
-    // Mock TypeConfig for testing
+    // Test TypeConfig
     #[derive(Debug, Default)]
     struct TestConfig;
 
-    #[derive(Debug, Clone, PartialEq)]
-    struct TestValue {
-        seq: u64,
-        data: String,
-    }
-
-    impl TestValue {
-        fn new(seq: u64, data: &str) -> Self {
-            Self {
-                seq,
-                data: data.to_string(),
-            }
-        }
-    }
-
-    // Mock Source implementation
-    #[derive(Debug)]
-    struct MockSource;
-
-    #[async_trait::async_trait]
-    impl crate::type_config::Source<TestValue> for MockSource {
-        async fn subscribe(
-            &self,
-            _left: &str,
-            _right: &str,
-        ) -> Result<EventStream<TestValue>, SubscribeError> {
-            unimplemented!("Mock implementation for testing")
-        }
-    }
-
     impl TypeConfig for TestConfig {
-        type Value = TestValue;
-        type Source = MockSource;
+        type Value = Val;
+        type Source = TestSource;
 
         fn value_seq(value: &Self::Value) -> u64 {
             value.seq
         }
 
-        fn spawn<F>(_future: F, _name: impl ToString)
+        fn spawn<F>(future: F, _name: impl ToString)
         where
             F: Future + Send + 'static,
             F::Output: Send + 'static,
         {
-            // Mock implementation - do nothing for tests
+            tokio::spawn(future);
         }
     }
 
     #[test]
     fn test_event_watcher_construction() {
+        let test_source = TestSource::new();
         let watcher = EventWatcher::<TestConfig> {
             left: "start".to_string(),
             right: "end".to_string(),
-            source: MockSource,
+            source: test_source,
             data: Arc::new(Mutex::new(Ok(CacheData::default()))),
             name: "test-watcher".to_string(),
         };
@@ -361,17 +337,159 @@ mod tests {
         assert_eq!(watcher.name, "test-watcher");
     }
 
-    // Test the basic structure and setup
-    // More complex async tests would require additional tokio setup
     #[test]
     fn test_cache_data_initialization() {
         let mut cache_data: CacheData<TestConfig> = CacheData::default();
 
         // Test applying updates directly (testing the underlying logic)
-        let test_value = TestValue::new(5, "test");
+        let test_value = Val::new(5, "test");
         cache_data.apply_update("key1".to_string(), None, Some(test_value.clone()));
 
         assert_eq!(cache_data.last_seq, 5);
         assert_eq!(cache_data.data.get("key1"), Some(&test_value));
+    }
+
+    #[tokio::test]
+    async fn test_real_event_watcher_integration() {
+        let test_source = TestSource::new();
+
+        // Pre-populate some initial data
+        test_source
+            .data
+            .lock()
+            .await
+            .insert("initial_key".to_string(), Val::new(1, "initial_value"));
+
+        let watcher = EventWatcher::<TestConfig> {
+            left: "".to_string(),
+            right: "z".to_string(),
+            source: test_source.clone(),
+            data: Arc::new(Mutex::new(Ok(CacheData::default()))),
+            name: "test-integration".to_string(),
+        };
+
+        // Get the event stream
+        let mut stream = watcher.source.subscribe("", "z").await.unwrap();
+
+        // Process initialization events
+        let mut cache_data = CacheData::<TestConfig>::default();
+        watcher
+            .initialize_cache(&mut cache_data, &mut stream)
+            .await
+            .unwrap();
+
+        // Verify initial data was loaded
+        assert_eq!(
+            cache_data.data.get("initial_key").unwrap(),
+            &Val::new(1, "initial_value")
+        );
+        assert_eq!(cache_data.last_seq, 1);
+
+        // Test updates through the test source
+        test_source.set("key1", Some("value1")).await;
+        test_source.set("key2", Some("value2")).await;
+        test_source.set("key1", Some("updated_value1")).await;
+        test_source.set("key2", None).await;
+
+        // Process the change events
+        for _ in 0..4 {
+            // 4 change events
+            if let Some(Ok(Event::Change(change))) = stream.next().await {
+                let (key, before, after) = change.unpack();
+                cache_data.apply_update(key, before, after);
+            }
+        }
+
+        // Verify final state
+        assert_eq!(
+            cache_data.data.get("key1").unwrap(),
+            &Val::new(3, "updated_value1")
+        );
+        assert!(!cache_data.data.contains_key("key2")); // deleted
+        assert_eq!(
+            cache_data.data.get("initial_key").unwrap(),
+            &Val::new(1, "initial_value")
+        ); // unchanged
+        assert_eq!(cache_data.last_seq, 3); // highest sequence number from key1 update
+    }
+
+    #[tokio::test]
+    async fn test_cache_consistency_scenarios() {
+        let _test_source = TestSource::new();
+        let mut cache_data = CacheData::<TestConfig>::default();
+
+        // Test various update scenarios
+
+        // 1. Insert new key
+        cache_data.apply_update("new_key".to_string(), None, Some(Val::new(1, "new_value")));
+        assert_eq!(
+            cache_data.data.get("new_key"),
+            Some(&Val::new(1, "new_value"))
+        );
+        assert_eq!(cache_data.last_seq, 1);
+
+        // 2. Update existing key
+        cache_data.apply_update(
+            "new_key".to_string(),
+            Some(Val::new(1, "new_value")),
+            Some(Val::new(2, "updated_value")),
+        );
+        assert_eq!(
+            cache_data.data.get("new_key"),
+            Some(&Val::new(2, "updated_value"))
+        );
+        assert_eq!(cache_data.last_seq, 2);
+
+        // 3. Delete key
+        cache_data.apply_update(
+            "new_key".to_string(),
+            Some(Val::new(2, "updated_value")),
+            None,
+        );
+        assert!(!cache_data.data.contains_key("new_key"));
+        assert_eq!(cache_data.last_seq, 2);
+
+        // 4. Test sequence ordering
+        cache_data.apply_update("seq_test1".to_string(), None, Some(Val::new(5, "value1")));
+        cache_data.apply_update("seq_test2".to_string(), None, Some(Val::new(3, "value2"))); // Lower seq
+        cache_data.apply_update("seq_test3".to_string(), None, Some(Val::new(7, "value3")));
+
+        assert_eq!(cache_data.last_seq, 7); // Should be highest
+        assert_eq!(cache_data.data.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_test_source_operations() {
+        let test_source = TestSource::new();
+
+        // Test direct operations on the test source
+        test_source.set("key1", Some("value1")).await;
+        test_source.set("key2", Some("value2")).await;
+
+        // Verify the source's internal state
+        let source_data = test_source.data.lock().await;
+        assert_eq!(source_data.get("key1").unwrap(), &Val::new(1, "value1"));
+        assert_eq!(source_data.get("key2").unwrap(), &Val::new(2, "value2"));
+        drop(source_data);
+
+        // Test update operation
+        test_source.set("key1", Some("updated_value1")).await;
+        let source_data = test_source.data.lock().await;
+        assert_eq!(
+            source_data.get("key1").unwrap(),
+            &Val::new(3, "updated_value1")
+        );
+        assert_eq!(source_data.len(), 2);
+        drop(source_data);
+
+        // Test delete operation
+        test_source.set("key2", None).await;
+        let source_data = test_source.data.lock().await;
+        assert!(!source_data.contains_key("key2"));
+        assert_eq!(source_data.len(), 1);
+        assert_eq!(
+            source_data.get("key1").unwrap(),
+            &Val::new(3, "updated_value1")
+        );
     }
 }
