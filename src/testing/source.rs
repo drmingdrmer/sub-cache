@@ -113,28 +113,40 @@ impl TestSource {
         };
     }
 
-    async fn send_initial_data(&self) {
-        // 先收集 data 快照，避免借用冲突
-        let (data_snapshot, mut subscriptions) = {
-            let mut state = self.state.lock().await;
-            (state.data.clone(), std::mem::take(&mut state.subscriptions))
-        };
+    async fn send_initial_data_to_subscription(
+        &self,
+        sender: &mpsc::UnboundedSender<Result<Event<Val>, ConnectionClosed>>,
+        left: &str,
+        right: &str,
+    ) -> bool {
+        // Get data snapshot without holding lock during event emission
+        let data_snapshot = {
+            let state = self.state.lock().await;
+            state.data.clone()
+        }; // Lock is released here
 
+        // Send initialization events only to the specific sender
+        // No lock held during event emission to avoid deadlock
         for (key, value) in data_snapshot.iter() {
-            subscriptions.retain_mut(|sub| {
-                sub.emit_event(
-                    Some(key),
-                    Event::Initialization(Change::new(key, None, Some(value.clone()))),
-                )
-                .is_ok()
-            });
+            // Check if key is in range
+            if key.as_str() < left || key.as_str() >= right {
+                continue;
+            }
+
+            if sender
+                .send(Ok(Event::Initialization(Change::new(
+                    key,
+                    None,
+                    Some(value.clone()),
+                ))))
+                .is_err()
+            {
+                return false; // Subscription failed
+            }
         }
 
-        subscriptions.retain_mut(|sub| sub.emit_event(None, Event::InitializationComplete).is_ok());
-
-        // 重新放回 subscriptions
-        let mut state = self.state.lock().await;
-        state.subscriptions = subscriptions;
+        // Send initialization complete event
+        sender.send(Ok(Event::InitializationComplete)).is_ok()
     }
 
     pub async fn get_data_snapshot(&self) -> BTreeMap<String, Val> {
@@ -164,6 +176,18 @@ impl Source<Val> for TestSource {
     async fn subscribe(&self, left: &str, right: &str) -> Result<EventStream<Val>, SubscribeError> {
         let (tx, rx) = mpsc::unbounded_channel();
 
+        // Send initial data to this specific subscription before adding it to the list
+        // This avoids the deadlock and ensures only this subscription gets initialization events
+        if !self
+            .send_initial_data_to_subscription(&tx, left, right)
+            .await
+        {
+            return Err(SubscribeError::Connection(ConnectionClosed::new_str(
+                "Failed to send initial data",
+            )));
+        }
+
+        // Add the subscription to the list only after successful initialization
         {
             let mut state = self.state.lock().await;
             state.subscriptions.push(Subscription {
@@ -172,8 +196,6 @@ impl Source<Val> for TestSource {
                 sender: tx,
             });
         }
-
-        self.send_initial_data().await;
 
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         Ok(Box::pin(stream))
@@ -205,12 +227,15 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_and_event_delivery() {
         let src = TestSource::new();
+        println!("---");
 
         // Subscribe to all keys
         let mut stream1 = src.subscribe("a", "z").await.unwrap();
+        println!("---");
         // Subscribe to only keys >= "m"
         let mut stream2 = src.subscribe("m", "z").await.unwrap();
 
+        println!("---");
         src.set("a", Some("v1")).await;
         src.set("m", Some("v2")).await;
         src.set("z", Some("v3")).await;
@@ -218,8 +243,9 @@ mod tests {
 
         // stream1 should see all changes except "z"
         let mut seen1 = vec![];
-        for _ in 0..5 {
+        for _ in 0..4 {
             if let Some(Ok(Event::Change(change))) = stream1.next().await {
+                println!("change: {:?}", change);
                 let (k, _, v) = change.unpack();
                 seen1.push((k, v.map(|v| v.data)));
             }
@@ -234,6 +260,7 @@ mod tests {
         let mut seen2 = vec![];
         for _ in 0..3 {
             if let Some(Ok(Event::Change(change))) = stream2.next().await {
+                println!("change: {:?}", change);
                 let (k, _, v) = change.unpack();
                 seen2.push((k, v.map(|v| v.data)));
             }
