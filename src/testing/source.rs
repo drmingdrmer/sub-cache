@@ -113,42 +113,6 @@ impl TestSource {
         };
     }
 
-    async fn send_initial_data_to_subscription(
-        &self,
-        sender: &mpsc::UnboundedSender<Result<Event<Val>, ConnectionClosed>>,
-        left: &str,
-        right: &str,
-    ) -> bool {
-        // Get data snapshot without holding lock during event emission
-        let data_snapshot = {
-            let state = self.state.lock().await;
-            state.data.clone()
-        }; // Lock is released here
-
-        // Send initialization events only to the specific sender
-        // No lock held during event emission to avoid deadlock
-        for (key, value) in data_snapshot.iter() {
-            // Check if key is in range
-            if key.as_str() < left || key.as_str() >= right {
-                continue;
-            }
-
-            if sender
-                .send(Ok(Event::Initialization(Change::new(
-                    key,
-                    None,
-                    Some(value.clone()),
-                ))))
-                .is_err()
-            {
-                return false; // Subscription failed
-            }
-        }
-
-        // Send initialization complete event
-        sender.send(Ok(Event::InitializationComplete)).is_ok()
-    }
-
     pub async fn get_data_snapshot(&self) -> BTreeMap<String, Val> {
         let state = self.state.lock().await;
         state.data.clone()
@@ -176,26 +140,46 @@ impl Source<Val> for TestSource {
     async fn subscribe(&self, left: &str, right: &str) -> Result<EventStream<Val>, SubscribeError> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Send initial data to this specific subscription before adding it to the list
-        // This avoids the deadlock and ensures only this subscription gets initialization events
-        if !self
-            .send_initial_data_to_subscription(&tx, left, right)
-            .await
-        {
-            return Err(SubscribeError::Connection(ConnectionClosed::new_str(
-                "Failed to send initial data",
-            )));
-        }
-
-        // Add the subscription to the list only after successful initialization
+        // Atomically send initial data and add subscription while holding the lock
+        // This prevents race conditions where changes occur between initialization and subscription addition
         {
             let mut state = self.state.lock().await;
+
+            // Send initial data to this new subscription while holding the lock
+            for (key, value) in state.data.iter() {
+                // Check if key is in range
+                if key.as_str() < left || key.as_str() >= right {
+                    continue;
+                }
+
+                if tx
+                    .send(Ok(Event::Initialization(Change::new(
+                        key,
+                        None,
+                        Some(value.clone()),
+                    ))))
+                    .is_err()
+                {
+                    return Err(SubscribeError::Connection(ConnectionClosed::new_str(
+                        "Failed to send initial data",
+                    )));
+                }
+            }
+
+            // Send initialization complete event
+            if tx.send(Ok(Event::InitializationComplete)).is_err() {
+                return Err(SubscribeError::Connection(ConnectionClosed::new_str(
+                    "Failed to send initialization complete",
+                )));
+            }
+
+            // Only add the subscription after successfully sending all initialization data
             state.subscriptions.push(Subscription {
                 left: left.to_string(),
                 right: right.to_string(),
                 sender: tx,
             });
-        }
+        } // Lock is released here
 
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         Ok(Box::pin(stream))
