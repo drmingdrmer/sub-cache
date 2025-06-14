@@ -6,6 +6,7 @@ use std::time::Duration;
 use sub_cache::testing::source::TestSource;
 use sub_cache::testing::source::Val;
 use sub_cache::testing::types::TestConfig;
+use sub_cache::testing::util::wait_for_cache_state;
 use sub_cache::Cache;
 use tokio::time::sleep;
 
@@ -39,24 +40,14 @@ async fn test_event_ordering_and_idempotency() {
     sleep(Duration::from_millis(100)).await;
 
     // 5. Verify updates were applied correctly
-    let mut synced = false;
-    for _ in 0..20 {
-        let v1 = cache.try_get("order/k1").await.unwrap();
-        let v2 = cache.try_get("order/k2").await.unwrap();
-        let v3 = cache.try_get("order/k3").await.unwrap();
-        let seq = cache.try_last_seq().await.unwrap();
-
-        if v1 == Some(Val::new(4, "v1_old"))
-            && v2 == Some(Val::new(2, "v2"))
-            && v3 == Some(Val::new(5, "v3"))
-            && seq == 5
-        {
-            synced = true;
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    assert!(synced, "cache did not sync correctly after updates");
+    wait_for_cache_state(&mut cache, 5, &[
+        ("order/k1", Some(Val::new(4, "v1_old"))),
+        ("order/k2", Some(Val::new(2, "v2"))),
+        ("order/k3", Some(Val::new(5, "v3"))),
+    ])
+    .await
+    .unwrap()
+    .expect("cache did not sync correctly after updates");
 
     // 6. Test sequence-based consistency
     // Events should be processed based on their sequence numbers
@@ -64,22 +55,12 @@ async fn test_event_ordering_and_idempotency() {
     source.set("order/k2", None).await; // seq=7 (delete)
 
     // Wait and verify final state
-    let mut final_synced = false;
-    for _ in 0..20 {
-        let v1 = cache.try_get("order/k1").await.unwrap();
-        let v2 = cache.try_get("order/k2").await.unwrap();
-        let v3 = cache.try_get("order/k3").await.unwrap();
-        let seq = cache.try_last_seq().await.unwrap();
-
-        if v1 == Some(Val::new(6, "final_value"))
-            && v2.is_none()
-            && v3 == Some(Val::new(5, "v3"))
-            && seq == 6
-        {
-            final_synced = true;
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    assert!(final_synced, "cache did not reach final consistent state");
+    wait_for_cache_state(&mut cache, 6, &[
+        ("order/k1", Some(Val::new(6, "final_value"))),
+        ("order/k2", None),
+        ("order/k3", Some(Val::new(5, "v3"))),
+    ])
+    .await
+    .unwrap()
+    .expect("cache did not reach final consistent state");
 }

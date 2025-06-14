@@ -1,12 +1,18 @@
 //! TestSource: a testable source for integration tests of the distributed cache.
 //! Provides a real event source with state, sequence, and event emission for EventWatcher tests.
 
-use crate::errors::{ConnectionClosed, SubscribeError};
-use crate::event_stream::{Change, Event, EventStream};
-use crate::type_config::Source;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+
+use crate::errors::ConnectionClosed;
+use crate::errors::SubscribeError;
+use crate::event_stream::Change;
+use crate::event_stream::Event;
+use crate::event_stream::EventStream;
+use crate::type_config::Source;
 
 #[derive(Debug)]
 struct Subscription {
@@ -23,7 +29,6 @@ impl Subscription {
             }
         }
 
-        
         // println!("Emitting event: {:?} for key: {:?}", event, key);
 
         self.sender.send(Ok(event.clone())).map_err(|_| "send")
@@ -137,6 +142,16 @@ impl TestSource {
         state.data.clone()
     }
 
+    /// Simulate connection drop by dropping all subscription senders
+    /// This will cause the cache to receive a connection closed error and trigger recovery
+    pub async fn drop_all_connections(&self, _reason: &str) {
+        let mut state = self.state.lock().await;
+
+        // Simply clear all subscriptions - this drops the senders
+        // which will cause the receivers to detect the connection is closed
+        state.subscriptions.clear();
+    }
+
     #[cfg(test)]
     pub async fn insert_for_test(&self, key: impl ToString, val: Val) {
         let mut state = self.state.lock().await;
@@ -167,10 +182,11 @@ impl Source<Val> for TestSource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::event_stream::Event;
     use futures::StreamExt;
     use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::event_stream::Event;
 
     #[tokio::test]
     async fn test_set_and_get() {
@@ -208,14 +224,11 @@ mod tests {
                 seen1.push((k, v.map(|v| v.data)));
             }
         }
-        assert_eq!(
-            seen1,
-            vec![
-                ("a".to_string(), Some("v1".to_string())),
-                ("m".to_string(), Some("v2".to_string())),
-                ("m".to_string(), None),
-            ]
-        );
+        assert_eq!(seen1, vec![
+            ("a".to_string(), Some("v1".to_string())),
+            ("m".to_string(), Some("v2".to_string())),
+            ("m".to_string(), None),
+        ]);
 
         // stream2 should only see changes for "m"
         let mut seen2 = vec![];
@@ -225,13 +238,10 @@ mod tests {
                 seen2.push((k, v.map(|v| v.data)));
             }
         }
-        assert_eq!(
-            seen2,
-            vec![
-                ("m".to_string(), Some("v2".to_string())),
-                ("m".to_string(), None),
-            ]
-        );
+        assert_eq!(seen2, vec![
+            ("m".to_string(), Some("v2".to_string())),
+            ("m".to_string(), None),
+        ]);
     }
 
     #[tokio::test]
@@ -302,13 +312,10 @@ mod tests {
                 changes.push((k, v.map(|v| v.data)));
             }
         }
-        assert_eq!(
-            changes,
-            vec![
-                ("b".to_string(), Some("v2x".to_string())),
-                ("d".to_string(), Some("v4".to_string())),
-                ("a".to_string(), None),
-            ]
-        );
+        assert_eq!(changes, vec![
+            ("b".to_string(), Some("v2x".to_string())),
+            ("d".to_string(), Some("v4".to_string())),
+            ("a".to_string(), None),
+        ]);
     }
 }

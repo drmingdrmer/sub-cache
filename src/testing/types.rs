@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::testing::source::TestSource;
+use crate::testing::source::Val;
 use crate::TypeConfig;
-use crate::testing::source::{TestSource, Val};
 
 #[derive(Debug, Default)]
 pub struct TestConfig;
@@ -31,6 +32,8 @@ impl TypeConfig for TestConfig {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // For testing, we need to spawn the future
+        // This works in both unit tests and integration tests when tokio rt is available
         tokio::spawn(future);
     }
 }

@@ -20,6 +20,7 @@ use std::time::Duration;
 use sub_cache::testing::source::TestSource;
 use sub_cache::testing::source::Val;
 use sub_cache::testing::types::TestConfig;
+use sub_cache::testing::util::check_cache_state;
 use sub_cache::Cache;
 use tokio::time::sleep;
 
@@ -50,10 +51,16 @@ async fn test_basic_sync() {
     }
     assert!(ok, "cache did not sync in time");
 
-    // 4. Check that local cache content matches data source
-    let v1 = cache.try_get("/k1").await.unwrap();
-    let v2 = cache.try_get("/k2").await.unwrap();
-    assert_eq!(v1, Some(Val::new(3, "v1x")));
-    assert_eq!(v2, None);
-    assert_eq!(cache.try_last_seq().await.unwrap(), 3);
+    // 4. Check that local cache content matches data source using utility function
+    let cache_check_result = check_cache_state(&mut cache, 3, &[
+        ("/k1", Some(Val::new(3, "v1x"))),
+        ("/k2", None),
+    ])
+    .await
+    .unwrap();
+
+    match cache_check_result {
+        Ok(()) => {} // All conditions satisfied
+        Err(error_msg) => panic!("Cache state check failed: {}", error_msg),
+    }
 }

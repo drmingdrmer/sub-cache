@@ -93,6 +93,7 @@ pub mod event_stream;
 pub mod testing {
     pub mod source;
     pub mod types;
+    pub mod util;
 }
 
 #[cfg(test)]

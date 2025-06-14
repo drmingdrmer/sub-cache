@@ -95,11 +95,19 @@ async fn test_continuous_write_consistency() {
         // Wait between checks to allow background writes to occur
         sleep(Duration::from_millis(100)).await;
 
-        // Get current cache state - this should always be consistent
-        let key1 = cache.try_get("continuous/key1").await.unwrap();
-        let key2 = cache.try_get("continuous/key2").await.unwrap();
-        let key3 = cache.try_get("continuous/key3").await.unwrap();
-        let cache_seq = cache.try_last_seq().await.unwrap();
+        // Get current cache state atomically for consistency validation
+        let cache_state_result = cache
+            .try_access(|cache_data| {
+                let key1 = cache_data.data.get("continuous/key1");
+                let key2 = cache_data.data.get("continuous/key2");
+                let key3 = cache_data.data.get("continuous/key3");
+                let cache_seq = cache_data.last_seq;
+
+                (key1.cloned(), key2.cloned(), key3.cloned(), cache_seq)
+            })
+            .await;
+
+        let (key1, key2, key3, cache_seq) = cache_state_result.unwrap();
 
         // Get current writer state for comparison
         let writer_count = write_counter.load(Ordering::Relaxed);
@@ -184,14 +192,22 @@ async fn test_continuous_write_consistency() {
     sleep(Duration::from_millis(200)).await;
 
     // Final consistency check after all writes have completed
-    let final_key1 = cache.try_get("continuous/key1").await.unwrap();
-    let final_key3 = cache.try_get("continuous/key3").await.unwrap();
-    let final_seq = cache.try_last_seq().await.unwrap();
+    // Use atomic access to get final state
+    let (final_key1_exists, final_key3_exists, final_seq) = cache
+        .try_access(|cache_data| {
+            let key1_exists = cache_data.data.get("continuous/key1").is_some();
+            let key3_exists = cache_data.data.get("continuous/key3").is_some();
+            let seq = cache_data.last_seq;
+            (key1_exists, key3_exists, seq)
+        })
+        .await
+        .unwrap();
+
     let final_writer_count = write_counter.load(Ordering::Relaxed);
 
     // Verify final state meets expectations
-    assert!(final_key1.is_some(), "key1 should exist at the end");
-    assert!(final_key3.is_some(), "key3 should exist at the end");
+    assert!(final_key1_exists, "key1 should exist at the end");
+    assert!(final_key3_exists, "key3 should exist at the end");
     assert!(final_seq > 0, "final sequence should be positive");
     assert!(
         final_writer_count > 0,

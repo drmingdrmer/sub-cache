@@ -1,7 +1,7 @@
-// 不支持订阅集成测试
+// Unsupported subscription integration test
 #[tokio::test]
 async fn test_unsupported_subscribe() {
-    // mock一个不支持subscribe的数据源
-    // watcher应进入降级/等待状态
-    // 可断言cache为Err(Unsupported)
+    // Mock a data source that doesn't support subscription
+    // Watcher should enter degraded/waiting state
+    // Can assert cache returns Err(Unsupported)
 }
